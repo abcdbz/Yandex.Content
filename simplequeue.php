@@ -11,23 +11,23 @@
  * $qs->putInQueue($jobData);
  */
 class SimpleQueue {
-    private $datasource;
-    private $queue_table;
+	private $datasource;
+	private $queue_table;
 	/**
 	 *
 	 * @param object $datasource MySQLi object or other, implementing "escape" and "query" methods
 	 * @param type $queue_table Table name for save queue to
 	 */
-    public function __construct($datasource, $queue_table) {
-        $this->datasource = $datasource;
+	public function __construct($datasource, $queue_table) {
+		$this->datasource = $datasource;
 		$this->queue_table = $queue_table;
-    }
+	}
 	/**
 	 *
 	 * @param string[] $jobData Data array 'tbl_column' => 'value'
 	 * @return integer Inserted row id
 	 */
-    public function putInQueue($jobData) {
+	public function putInQueue($jobData) {
 		$insertsql = array(
 			'`created` = ' . date("'YmdHis'", time())
 		);
@@ -39,7 +39,7 @@ class SimpleQueue {
 			return false;
 		}
 		return $this->datasource->insert_id;
-    }
+	}
 	/**
 	 *
 	 * @return string[][] Array of active jobs 'jobid' => jobdata[]
