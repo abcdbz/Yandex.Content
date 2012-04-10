@@ -14,6 +14,16 @@ class YandexContent {
 	const TEXT_LENGTH_MIN = 2000;
 	const TEXT_LENGTH_MAX = 32000;
 
+	const ERR_LOGIN_FAILED = 1;
+	const ERR_ARTICLE_LIST_NOT_FOUND = 2;
+	const ERR_POST_FAILED_WITH_MAXTRIES = 3;
+	const ERR_AUTORELOGIN_FAILED = 4;
+	const ERR_BAD_RESPONSE_CODE = 5;
+	const ERR_WRONG_TEXT_SIZE = 6;
+	const ERR_SITE_NAME_NOT_ALLOWED = 7;
+	const ERR_SITE_LIST_NOT_FOUND = 8;
+	const ERR_NOT_LOGGED_IN = 9;
+
 	private $errmsg;
 	private $errcode;
 
@@ -40,8 +50,15 @@ class YandexContent {
 			return $this->error('Cant write to curl cookie file [' . $this->cookie_filename . ']', 1);
 		}
 		if (!$this->isLoggedIn() and !$this->logIn()) {
-			return $this->error('Failed to log in to yandex.webmaster', 8);
+			return $this->error('Failed to log in to yandex.webmaster', self::ERR_LOGIN_FAILED);
 		}
+		// кто то спрашивал, почему я люблю exceptions и не люблю $this->error
+		// смотрим строки выше: $this->isLoggedIn() первый раз ставит $this->error = 'фиг'
+		// затем идет $this->logIn(), где все проходит нормально, но как это понять?
+		// ведь ошибка все еще в $this->error, кто ее должен стирать? "а хз.. давайте я".
+		// вот тут и стираем, а то в крон скрипте после создания объекта вечная ошибка ERR_LOGIN_FAILED
+		// upd: при рефакторинге $this->errcode = $this->errmsg = null заменено на return $this->noError()
+		return $this->noError();
 	}
 	public function __destruct() {
 		if ($this->curl_handler) {
@@ -83,7 +100,7 @@ class YandexContent {
 			return $this->error('cURL error: ' . curl_error($curl), curl_errno($curl));
 		}
 		if (!$this->isLoggedIn()) {
-			return $this->error('Login failed', 5);
+			return $this->error('Login failed', self::ERR_LOGIN_FAILED);
 		}
 		return true;
 	}
@@ -99,8 +116,8 @@ class YandexContent {
 		if ($result === false) {
 			return $this->error('cURL error: ' . curl_error($curl), curl_errno($curl));
 		}
-		if (strpos($result, 'http://passport.yandex.ru/passport?mode=logout') === false) {
-			return $this->error('Not logged in, logout button not found', 6);
+		if (mb_strpos($result, 'http://passport.yandex.ru/passport?mode=logout') === false) {
+			return $this->error('Not logged in, logout button not found', self::ERR_NOT_LOGGED_IN);
 		}
 		return true;
 	}
@@ -113,26 +130,27 @@ class YandexContent {
 		$curl = $this->getCurlHandler();
 		curl_setopt($curl, CURLOPT_URL, $this->getBaseUrl());
 		$page = curl_exec($curl);
-		if ($page === false) {
+		if ($result === false) {
 			return $this->error('cURL error: ' . curl_error($curl), curl_errno($curl));
 		}
 		$pattern = '~mvc\.map\(.*,\[(".*)\]~Ui';
-		if ( !preg_match_all($pattern, $page, $matches) || !isset($matches[1][1]) ) {
-			return $this->error('Site list not found in response', 2);
-		}
-		// :FIX: Silvery 25.01.2012
-		// Yandex code for site list were changed	
-		if ( !preg_match_all('~"(.*)","(.*)","(.*)",(.*)(?=,)~U', $matches[1][1], $sitematch, PREG_SET_ORDER) ) {
-			return $this->error('No sites found', 2);
+		if (!preg_match_all($pattern, $page, $matches)) {
+			return $this->error('Site list not found in response', self::ERR_SITE_LIST_NOT_FOUND);
 		}
 		$found = array();
-		foreach ($sitematch as $idx => $site) {
-			$is_approved = ($site[4] == 'true');
+		foreach ($matches[1] as $idx => $string) {
+			$tmp = explode(',', $string);
+			// if data broken, skip
+			if (!isset($tmp[1]) or !isset($tmp[2]) or !isset($tmp[3])) {
+				continue;
+			}
+			$site_id = $tmp[1];
+			$site_name = $tmp[2];
+			$is_approved = ($tmp[3] == 'true');
 			if ($is_approved or !$only_approved) {
-				$found[$site[1]] = $site[3];
+				$found[$site_id] = $site_name;
 			}
 		}
-		// END:FIX:
 		return $found;
 	}
 	/**
@@ -143,111 +161,24 @@ class YandexContent {
 	 * @return boolean
 	 */
 	public function postArticle($text, $site_name) {
-		$text = strip_tags($text);
-		$text = trim($text);
-		if ( empty($site_name) ) {
-			return $this->error('Empty site name not allowed', 3);
+		if (empty($site_name)) {
+			return $this->error('Empty site name not allowed', self::ERR_SITE_NAME_NOT_ALLOWED);
 		}
-		if ( ($len = mb_strlen($text)) < self::TEXT_LENGTH_MIN ) {
-			return $this->error('Wrong text size (' . $len . '). Must be greater than ' .
-				self::TEXT_LENGTH_MIN, 3);
+		$text = strip_tags(html_entity_decode($text, ENT_QUOTES, $this->getInputEncoding($text)));
+		if (($len = mb_strlen($text)) < self::TEXT_LENGTH_MIN) {
+			return $this->error('Wrong text size (' . $len . '). Must be between ' .
+				self::TEXT_LENGTH_MIN . ' and ' . self::TEXT_LENGTH_MAX, self::ERR_WRONG_TEXT_SIZE);
 		}
-		// :FIX: Silvery 24.01.2012
-		// Split text into parts if needed
-		$texts = $this->splitTextByLength($text);
-		if ( !$texts ) {
-			return false;
-		}
-
-		foreach ( $texts AS $val ) {
-			$res = $this->sendArticleText($val, $site_name);
-			if ( !$res ) {
-				return false;
+		if ($len > self::TEXT_LENGTH_MAX) {
+			$delimiter = '#$#$#$#';
+			// разбиваем, да так, чтоб хвост был длиннее self::TEXT_LENGTH_MIN
+			$wrapped = explode($delimiter, wordwrap($text, self::TEXT_LENGTH_MAX - self::TEXT_LENGTH_MIN, $delimiter));
+			$result = true;
+			foreach ($wrapped as $subtext) {
+				$result = $result && $this->postArticle($subtext, $site_name);
 			}
+			return $result;
 		}
-		return true;
-	}
-	/**
-	 * :ADD: Silvery 24.01.2012
-	 * Split text into readable parts with length less than TEXT_LENGTH_MAX each
-	 * @param string $text
-	 * @return mixed 
-	 */
-	private function splitTextByLength($text) {
-		$encoding = $this->getInputEncoding($text);
-		mb_internal_encoding($encoding);
-		
-		$result = array(); 
-		$i = 0;
-		$match = '~^(\n*)[A-ZА-Я0-9]~';
-		// Rather cruel but still...
-		if ($encoding == 'utf-8') {
-			$match = iconv('cp1251', 'utf-8', $match . 'u');
-		}
-		// Additional condition to avoid endless loop
-		$limit = mb_strlen($text) / self::TEXT_LENGTH_MAX + 1;
-		while ( mb_strlen($text) > self::TEXT_LENGTH_MAX && $i < $limit ) {
-			$result[$i] = ltrim( mb_substr($text, 0, self::TEXT_LENGTH_MAX) );
-			$text = mb_substr($text, self::TEXT_LENGTH_MAX);
-			// If tail is less than TEXT_LENGTH_MIN - add some text
-			if ( ($len = mb_strlen($text)) < self::TEXT_LENGTH_MIN ) {
-				$text = mb_substr($result[$i], $len - self::TEXT_LENGTH_MIN) . $text;
-				$result[$i] = mb_substr($result[$i], 0, $len - self::TEXT_LENGTH_MIN);
-			}
-			// Find and move endless sentence from the ending
-			$noend = true;
-			$subcheck = false;
-			$k = 0;
-			// Additional condition to avoid endless loop (1000 symbols should be enough)
-			while ( $noend && $k < 10 ) {
-				$k++;
-				$part = mb_substr($result[$i], -100);
-				// Need only spaces after dot instead of variety of special symbols
-				$lpart = str_replace(array("\n", "\r", "\t"), ' ', $part);
-				// Check last symbol if previous part started with uppercase or number
-				if ( $subcheck ) {
-					if ( mb_substr( rtrim($lpart), -1) == '.' ) {
-						$noend = false;
-						continue;
-					} else {
-						$subcheck = false;
-					}
-				}
-				$part_split = explode('. ', $lpart);
-
-				$add = array();
-				// Check for uppercase or number in the beginning of each part
-				while ( ($part_item = array_pop($part_split)) && $noend ) {
-					array_unshift($add, $part_item);
-					if ( preg_match($match, $part_item) ) {
-						if ( count($part_split) > 0 ) {
-							// Not first - there was dot before
-							$part = implode('. ', $add);
-							$noend = false;
-						} else {
-							// Need to check previous symbols - on the next step
-							$subcheck = true;
-						}
-					} 
-				}
-				$text = $part . $text;
-				$result[$i] = mb_substr($result[$i], 0, mb_strlen($result[$i]) - mb_strlen($part));
-			}
-			if ( $noend ) {
-				return $this->error('Can`t split text into parts', 12);
-			}
-			$i++;
-		}
-		$result[$i] = $text;
-		return $result;
-	}
-	/**
-	 * Actually send text
-	 * @param string $text
-	 * @param string $site_name
-	 * @return type 
-	 */
-	private function sendArticleText($text, $site_name) {
 		$text_head = mb_substr($text, 0, 100); // for post check
 		$text = $this->convertEncoding($text);
 		$postfields = array(
@@ -277,19 +208,28 @@ class YandexContent {
 			}
 			// if posted successfully, result contains $text_head
 			$result = $this->convertEncoding($result, true);
+			// обработка ответа, заменим строки "\n" на настоящий LF и декодируем html обратно
+			$result = str_replace(array('\n', '\t'), array("\n", "\t"), htmlspecialchars_decode($result));
 			if (mb_strpos(stripslashes($result), $text_head) === false) {
 				// if text not found, but we have HTTP 200 OK, maybe we are not logged in?
 				if ($http_code != 200) {
-					return $this->error('Post failed. Response HTTP code ' . $http_code, 9);
+					return $this->error('Post failed. Response HTTP code ' . $http_code, self::ERR_BAD_RESPONSE_CODE);
 				}
 				if (!$this->isLoggedIn() and !$this->logIn()) {
-					return $this->error('Post failed. Unrecoverable authorization lost', 10);
+					return $this->error('Post failed. Unrecoverable authorization lost', self::ERR_AUTORELOGIN_FAILED);
 				}
 				continue; // try one more time
 			}
-			return true;
+			// а вот тут уже опасно! читали коммент в конструкторе? продолжаем!
+			// случился у нас, например, ERR_WRONG_TEXT_SIZE, ошибку записали, след.текст обрабатываем
+			// все хорошо, но ошибка-то сохранена и проверяя ее снаружи мы можем сделать
+			// неверный вывод, что и тут косяк произошел! и, руководствуясь им, например
+			// удалить задание из очереди почем зря.. что делать? конечно надо почистить ошибки!
+			// тут уже рефакторинг придется делать, return true заменим на return $this->noError()
+			// во как!
+			return $this->noError();
 		}
-		return $this->error('Post failed with maximum tries', 11);
+		return $this->error('Post failed with maximum tries', self::ERR_POST_FAILED_WITH_MAXTRIES);
 	}
 	/**
 	 * Get posted article list for given site name
@@ -316,7 +256,7 @@ class YandexContent {
 		$result = $this->convertEncoding($result, true);
 		$pattern = '~"Original_text","([^"]+)",[^,]+,"(.*)",[^,]+,"([^"]+)"~U';
 		if (!preg_match_all($pattern, $result, $matches)) {
-			return $this->error('Article list not found in response', 4);
+			return $this->error('Article list not found in response', self::ERR_ARTICLE_LIST_NOT_FOUND);
 		}
 		$found = array();
 		foreach ($matches[1] as $idx => $text_id) {
@@ -335,6 +275,10 @@ class YandexContent {
 		return $this->errcode;
 	}
 
+	private function noError() {
+		$this->errcode = $this->errmsg = null;
+		return true;
+	}
 	private function error($errmsg, $errcode) {
 		$this->errmsg = $errmsg;
 		$this->errcode = $errcode;
@@ -353,7 +297,7 @@ class YandexContent {
 			($reverse ? 'out' : 'in') => $this->getInputEncoding($text),
 			($reverse ? 'in' : 'out') => $this->getOutputEncoding()
 		);
-		return ($encodings['in'] == $encodings['out'] ? $text : iconv($encodings['in'], $encodings['out']."//TRANSLIT", $text));
+		return ($encodings['in'] == $encodings['out'] ? $text : iconv($encodings['in'], $encodings['out'], $text));
 	}
 	/**
 	 *
@@ -365,7 +309,7 @@ class YandexContent {
 		}
 		return strtolower($this->input_encoding);
 	}
-	public function detectEncoding($text) {
+	private function detectEncoding($text) {
 		if (!preg_match('//u', $text)) {
 			return 'cp1251';
 		}
@@ -422,6 +366,9 @@ class YandexContent {
 			$this->curl_handler = curl_init();
 			curl_setopt($this->curl_handler, CURLOPT_RETURNTRANSFER, true);
 			curl_setopt($this->curl_handler, CURLOPT_FOLLOWLOCATION, true);
+			// force HTTP/1.0, otherwise yandex make HTTP 417 response on request
+			// with header "Expect: 100-continue"
+			curl_setopt($this->curl_handler, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
 			if ($cookie_filename = $this->getCurlCookieFilename()) {
 				curl_setopt($this->curl_handler, CURLOPT_COOKIEFILE, $cookie_filename);
 				curl_setopt($this->curl_handler, CURLOPT_COOKIEJAR, $cookie_filename);
