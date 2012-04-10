@@ -273,6 +273,7 @@
 			return $this->error( 'Post failed with maximum tries', self::ERR_POST_FAILED_WITH_MAXTRIES );
 		}
 
+
 		/**
 		 * Get posted article list for given site name
 		 *

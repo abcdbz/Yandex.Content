@@ -24,7 +24,7 @@ getSiteList($only_approved = true)
 $YC = new YandexContent('login', 'passwd', true);
 ```
 
- - запостить текст
+ - запостить текст:
 
 ```php
 $YC->postArticle($text, $site_name);
